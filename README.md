@@ -35,8 +35,25 @@ Offset  Len   Field
 
 - **Send window**: up to 64 unacknowledged packets in flight (configurable)
 - **Retransmit**: packets not ACKed within 500 ms are resent (up to 10 attempts)
+- **Immediate ACK**: every received DATA packet triggers a standalone ACK reply,
+  preventing retransmit timeouts during idle periods (e.g. waiting for shell input)
 - **Duplicate detection**: 512-slot sliding window bitmap per session
 - **Keepalive**: KA packets every 15 s to keep firewall state alive
+- **TCP-style ACK semantics**: ACK=N means all sequence numbers < N are received
+
+### ICMP Identifier Scheme
+
+sshoi uses two distinct ICMPv6 Echo identifiers to prevent the Linux kernel's
+automatic Echo Reply from corrupting tunnel data:
+
+| Direction | Type | Identifier |
+|-----------|------|-----------|
+| client → server | Echo Request | `0x5348` ("SH") |
+| server → client | Echo Reply | `0x5349` ("SI") |
+
+The kernel auto-replies to Echo Requests using the same identifier as the
+request (`0x5348`). Since sshoi-client only accepts replies with `0x5349`,
+kernel-generated echoes are silently discarded before reaching the tunnel.
 
 ## Build
 
@@ -53,7 +70,7 @@ go build -o sshoi-server ./cmd/server
 
 ```sh
 export SSHOI_PASSPHRASE=your-shared-secret
-sudo ./sshoi-server [-sshd 127.0.0.1:22] [-v]
+sudo ./sshoi-server [-iface eth0] [-sshd 127.0.0.1:22] [-v]
 ```
 
 **Client** (run on the restricted machine):
@@ -61,6 +78,12 @@ sudo ./sshoi-server [-sshd 127.0.0.1:22] [-v]
 ```sh
 export SSHOI_PASSPHRASE=your-shared-secret
 sudo ./sshoi-client -server 2001:db8::1 [-listen 127.0.0.1:2222] [-v]
+```
+
+For **link-local** (`fe80::`) server addresses, `-iface` is required on the client:
+
+```sh
+sudo ./sshoi-client -server fe80::1 -iface eth0 [-listen 127.0.0.1:2222] [-v]
 ```
 
 **Connect via SSH**:
@@ -76,26 +99,29 @@ ssh -p 2222 user@127.0.0.1
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-server` | *(required)* | Server IPv6 address |
+| `-iface` | `""` | Network interface for ICMPv6 (required for link-local `fe80::` addresses) |
 | `-listen` | `127.0.0.1:2222` | Local TCP listen address |
 | `-passphrase` | `$SSHOI_PASSPHRASE` | Shared passphrase |
 | `-keepalive` | `15s` | Keepalive interval |
 | `-retransmit` | `500ms` | Retransmit timeout |
-| `-v` | false | Verbose logging |
+| `-v` | false | Verbose logging (adds microseconds + file/line) |
 
 ### sshoi-server
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-sshd` | `127.0.0.1:22` | Local sshd address |
+| `-iface` | `""` | Network interface for ICMPv6 (used for link-local reply routing) |
+| `-sshd` | `127.0.0.1:22` | Local sshd address to relay to |
 | `-passphrase` | `$SSHOI_PASSPHRASE` | Shared passphrase |
 | `-keepalive` | `15s` | Keepalive interval |
 | `-retransmit` | `500ms` | Retransmit timeout |
-| `-v` | false | Verbose logging |
+| `-v` | false | Verbose logging (adds microseconds + file/line) |
 
 ## Security Notes
 
-- The ICMPv6 identifier field is set to `0x5348` ("SH") to filter non-sshoi
-  pings; this is a convenience filter, not a security mechanism.
+- Echo Request and Reply packets use separate ICMP identifiers (`0x5348` /
+  `0x5349`) to filter non-sshoi traffic and neutralise kernel echo-back; these
+  are convenience filters, not security mechanisms.
 - Restrict the server's ICMPv6 receive to trusted source addresses with
   `ip6tables` for defence in depth:
   ```sh
