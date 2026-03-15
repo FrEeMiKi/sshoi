@@ -64,8 +64,12 @@ type Session struct {
 	outbound chan []byte // plaintext from tcpConn → encrypt and send
 	SendWire chan []byte // fully encoded wire packets ready for ICMPv6 send
 
-	closeOnce sync.Once
-	closed    chan struct{}
+	closeOnce       sync.Once
+	closed          chan struct{}
+	// established is closed when the session reaches StateEstablished.
+	// StartEncodeLoop blocks on this so DATA is never sent before the handshake.
+	established     chan struct{}
+	establishedOnce sync.Once
 
 	lastActivity      time.Time
 	keepaliveInterval time.Duration
@@ -99,6 +103,7 @@ func NewSession(cfg SessionConfig) *Session {
 		outbound:          make(chan []byte, 32),
 		SendWire:          make(chan []byte, 64),
 		closed:            make(chan struct{}),
+		established:       make(chan struct{}),
 		lastActivity:      time.Now(),
 		keepaliveInterval: ka,
 		retransmitTimeout: rt,
@@ -202,6 +207,15 @@ func (s *Session) Close() {
 // Done returns a channel closed when the session reaches StateClosed.
 func (s *Session) Done() <-chan struct{} { return s.closed }
 
+// markEstablished transitions to StateEstablished and unblocks StartEncodeLoop.
+// Safe to call multiple times.
+func (s *Session) markEstablished() {
+	s.mu.Lock()
+	s.state = StateEstablished
+	s.mu.Unlock()
+	s.establishedOnce.Do(func() { close(s.established) })
+}
+
 // handleFlags drives state transitions based on received packet flags.
 func (s *Session) handleFlags(pkt *Packet) {
 	s.mu.Lock()
@@ -214,9 +228,7 @@ func (s *Session) handleFlags(pkt *Packet) {
 	case flags&FlagSYN != 0 && flags&FlagACK != 0:
 		// SYN+ACK: client receives this during handshake.
 		if state == StateHandshake {
-			s.mu.Lock()
-			s.state = StateEstablished
-			s.mu.Unlock()
+			s.markEstablished()
 			log.Printf("session %d: established", s.id)
 			_ = s.sendControlPacket(FlagACK, pkt.Seq+1)
 		}
@@ -224,9 +236,7 @@ func (s *Session) handleFlags(pkt *Packet) {
 	case flags&FlagSYN != 0:
 		// SYN: server receives this for a new session.
 		if state == StateNew {
-			s.mu.Lock()
-			s.state = StateEstablished
-			s.mu.Unlock()
+			s.markEstablished()
 			log.Printf("session %d: established (server)", s.id)
 			_ = s.sendControlPacket(FlagSYN|FlagACK, pkt.Seq+1)
 		}
@@ -378,6 +388,13 @@ func (s *Session) tcpWriteLoop() {
 // This goroutine is started externally after session establishment.
 func (s *Session) StartEncodeLoop() {
 	go func() {
+		// Block until the handshake completes. This prevents DATA packets
+		// from being sent before the server has seen a SYN for this session.
+		select {
+		case <-s.established:
+		case <-s.closed:
+			return
+		}
 		for {
 			select {
 			case chunk := <-s.outbound:

@@ -14,8 +14,9 @@ import (
 
 // Config holds client startup parameters.
 type Config struct {
-	ListenAddr        string // e.g. "127.0.0.1:2222"
-	ServerIPv6        net.IP
+	ListenAddr        string      // e.g. "127.0.0.1:2222"
+	ServerAddr        *net.IPAddr // IPv6 address with Zone for link-local
+	IfaceName         string      // outbound interface, e.g. "eth0"
 	Cipher            *tunnel.Cipher
 	KeepaliveInterval time.Duration
 	RetransmitTimeout time.Duration
@@ -26,21 +27,21 @@ type Config struct {
 type Client struct {
 	cfg      Config
 	conn     *icmpv6.Conn
-	sessions sync.Map  // map[uint16]*tunnel.Session
-	nextID   uint32    // atomic, wraps at 65535
+	sessions sync.Map // map[uint16]*tunnel.Session
+	nextID   uint32   // atomic, wraps at 65535
 	outbound chan outboundMsg
 	closed   chan struct{}
 	once     sync.Once
 }
 
 type outboundMsg struct {
-	dst  net.IP
+	dst  *net.IPAddr
 	data []byte
 }
 
 // New creates a Client.
 func New(cfg Config) (*Client, error) {
-	conn, err := icmpv6.Listen(256)
+	conn, err := icmpv6.Listen(cfg.IfaceName, 256)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +60,7 @@ func (c *Client) Run() error {
 		return err
 	}
 	log.Printf("client: listening on %s", c.cfg.ListenAddr)
-	log.Printf("client: tunnel server %s", c.cfg.ServerIPv6)
+	log.Printf("client: tunnel server %s", c.cfg.ServerAddr)
 
 	go c.icmpRecvLoop()
 	go c.icmpSendLoop()
@@ -100,7 +101,6 @@ func (c *Client) Close() error {
 
 // newSession allocates a session, starts it, and registers it.
 func (c *Client) newSession(tcpConn net.Conn) {
-	// Allocate a session ID (1-65535, skip 0).
 	id := uint16(atomic.AddUint32(&c.nextID, 1) % 65535)
 	if id == 0 {
 		id = 1
@@ -119,10 +119,8 @@ func (c *Client) newSession(tcpConn net.Conn) {
 	c.sessions.Store(id, sess)
 	log.Printf("client: new session %d for %s", id, tcpConn.RemoteAddr())
 
-	// Fan-in this session's SendWire onto our shared outbound channel.
 	go c.fanInSession(sess)
 
-	// Wait for session to close, then deregister.
 	go func() {
 		<-sess.Done()
 		c.sessions.Delete(id)
@@ -139,7 +137,7 @@ func (c *Client) fanInSession(sess *tunnel.Session) {
 				return
 			}
 			select {
-			case c.outbound <- outboundMsg{dst: c.cfg.ServerIPv6, data: wire}:
+			case c.outbound <- outboundMsg{dst: c.cfg.ServerAddr, data: wire}:
 			case <-c.closed:
 				return
 			case <-sess.Done():
@@ -161,7 +159,6 @@ func (c *Client) icmpRecvLoop() {
 			if !ok {
 				return
 			}
-			// Client receives Echo Replies (type 129).
 			if pkt.Type != icmpv6.ICMPv6TypeEchoReply {
 				continue
 			}
@@ -177,8 +174,7 @@ func (c *Client) icmpRecvLoop() {
 				log.Printf("client: unknown session %d, dropping", hdr.SessionID)
 				continue
 			}
-			sess := v.(*tunnel.Session)
-			if err := sess.ReceivePacket(pkt.Data); err != nil {
+			if err := v.(*tunnel.Session).ReceivePacket(pkt.Data); err != nil {
 				log.Printf("client: session %d recv error: %v", hdr.SessionID, err)
 			}
 		case <-c.closed:
@@ -187,7 +183,7 @@ func (c *Client) icmpRecvLoop() {
 	}
 }
 
-// icmpSendLoop drains the shared outbound channel and sends packets.
+// icmpSendLoop drains the shared outbound channel and sends Echo Requests.
 func (c *Client) icmpSendLoop() {
 	for {
 		select {

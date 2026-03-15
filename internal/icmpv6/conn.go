@@ -25,46 +25,62 @@ const (
 )
 
 // RawPacket is a received ICMPv6 packet with metadata.
+// Src is a full IPAddr so the Zone (interface name) is preserved for
+// link-local addresses — without the Zone, replies to fe80:: cannot be routed.
 type RawPacket struct {
-	Src  net.IP
-	Type byte   // 128 or 129
-	Data []byte // ICMPv6 data field (tunnel payload)
+	Src  *net.IPAddr // Zone is set for link-local sources
+	Type byte        // 128 or 129
+	Data []byte      // ICMPv6 data field (tunnel payload)
 }
 
 // Conn wraps a raw ICMPv6 socket.
 type Conn struct {
-	pc      *ipv6.PacketConn
-	recvBuf chan *RawPacket
-	closed  chan struct{}
-	once    sync.Once
+	pc       *ipv6.PacketConn
+	ifaceName string // used as Zone when sending to link-local destinations
+	recvBuf  chan *RawPacket
+	closed   chan struct{}
+	once     sync.Once
 }
 
 // Listen opens a raw ICMPv6 socket. Requires CAP_NET_RAW / root.
+// ifaceName is the outbound interface (e.g. "eth0") used when sending to
+// link-local (fe80::) addresses. Pass "" to skip zone tagging.
 // bufSize is the RawPacket channel capacity (suggested: 256).
-func Listen(bufSize int) (*Conn, error) {
-	// "ip6:ipv6-icmp" is the network string for raw ICMPv6.
+func Listen(ifaceName string, bufSize int) (*Conn, error) {
 	c, err := net.ListenPacket("ip6:ipv6-icmp", "::")
 	if err != nil {
 		return nil, err
 	}
 	pc := ipv6.NewPacketConn(c)
 	conn := &Conn{
-		pc:      pc,
-		recvBuf: make(chan *RawPacket, bufSize),
-		closed:  make(chan struct{}),
+		pc:        pc,
+		ifaceName: ifaceName,
+		recvBuf:   make(chan *RawPacket, bufSize),
+		closed:    make(chan struct{}),
 	}
 	go conn.recvLoop()
 	return conn, nil
 }
 
 // SendEchoRequest sends an ICMPv6 Echo Request (type 128) to dst.
-func (c *Conn) SendEchoRequest(dst net.IP, data []byte) error {
-	return c.send(ipv6.ICMPTypeEchoRequest, dst, data)
+// dst.Zone is used directly; if empty and the address is link-local,
+// the Conn's ifaceName is substituted.
+func (c *Conn) SendEchoRequest(dst *net.IPAddr, data []byte) error {
+	return c.send(ipv6.ICMPTypeEchoRequest, c.resolveZone(dst), data)
 }
 
 // SendEchoReply sends an ICMPv6 Echo Reply (type 129) to dst.
-func (c *Conn) SendEchoReply(dst net.IP, data []byte) error {
-	return c.send(ipv6.ICMPTypeEchoReply, dst, data)
+func (c *Conn) SendEchoReply(dst *net.IPAddr, data []byte) error {
+	return c.send(ipv6.ICMPTypeEchoReply, c.resolveZone(dst), data)
+}
+
+// resolveZone returns dst with Zone filled in from ifaceName when the
+// address is link-local and no explicit zone is set.
+func (c *Conn) resolveZone(dst *net.IPAddr) *net.IPAddr {
+	if dst.Zone == "" && dst.IP.IsLinkLocalUnicast() && c.ifaceName != "" {
+		return &net.IPAddr{IP: dst.IP, Zone: c.ifaceName}
+	}
+	return dst
 }
 
 // Recv returns the channel of received RawPackets.
@@ -81,7 +97,7 @@ func (c *Conn) Close() error {
 }
 
 // send constructs and transmits an ICMPv6 echo packet.
-func (c *Conn) send(msgType icmp.Type, dst net.IP, data []byte) error {
+func (c *Conn) send(msgType icmp.Type, dst *net.IPAddr, data []byte) error {
 	if len(data) > maxICMPPayload {
 		return errors.New("payload too large")
 	}
@@ -89,17 +105,16 @@ func (c *Conn) send(msgType icmp.Type, dst net.IP, data []byte) error {
 	if err != nil {
 		return err
 	}
-	addr := &net.UDPAddr{IP: dst}
-	_, err = c.pc.WriteTo(wire, nil, addr)
+	_, err = c.pc.WriteTo(wire, nil, dst)
 	return err
 }
 
 // buildICMPv6 marshals an ICMPv6 echo message with our identifier.
 func buildICMPv6(msgType icmp.Type, data []byte) ([]byte, error) {
-	// Build echo body manually: ID(2) + Seq(2) + data
+	// Echo body: ID(2) + Seq(2) + tunnel payload
 	body := make([]byte, 4+len(data))
 	binary.BigEndian.PutUint16(body[0:2], ICMPIdentifier)
-	binary.BigEndian.PutUint16(body[2:4], 0) // seq=0, tunnel seq is in payload
+	binary.BigEndian.PutUint16(body[2:4], 0) // ICMP seq=0; tunnel seq is in payload
 	copy(body[4:], data)
 
 	msg := icmp.Message{
@@ -107,7 +122,7 @@ func buildICMPv6(msgType icmp.Type, data []byte) ([]byte, error) {
 		Code: 0,
 		Body: &icmp.RawBody{Data: body},
 	}
-	// Checksum is inserted by the kernel for IPv6; pass 0.
+	// Kernel inserts the checksum for IPv6.
 	return msg.Marshal(nil)
 }
 
@@ -121,7 +136,6 @@ func (c *Conn) recvLoop() {
 		default:
 		}
 
-		// Set a short read deadline so we can check c.closed periodically.
 		_ = c.pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 
 		n, _, src, err := c.pc.ReadFrom(buf)
@@ -138,10 +152,9 @@ func (c *Conn) recvLoop() {
 			}
 		}
 
-		raw := buf[:n]
-		pkt, err := parseICMPv6(raw, src)
+		pkt, err := parseICMPv6(buf[:n], src)
 		if err != nil {
-			continue // not our packet or parse error
+			continue
 		}
 
 		select {
@@ -149,16 +162,15 @@ func (c *Conn) recvLoop() {
 		case <-c.closed:
 			return
 		default:
-			// Drop if buffer full.
 			log.Printf("icmpv6: recv buffer full, dropping packet")
 		}
 	}
 }
 
-// parseICMPv6 parses a raw ICMPv6 message and returns a RawPacket if it
-// matches our identifier, otherwise returns an error.
+// parseICMPv6 parses a raw ICMPv6 message. Returns a RawPacket preserving
+// the source Zone (critical for link-local reply routing).
 func parseICMPv6(raw []byte, src net.Addr) (*RawPacket, error) {
-	msg, err := icmp.ParseMessage(58 /* ICMPv6 proto */, raw)
+	msg, err := icmp.ParseMessage(58 /* ICMPv6 */, raw)
 	if err != nil {
 		return nil, err
 	}
@@ -177,26 +189,26 @@ func parseICMPv6(raw []byte, src net.Addr) (*RawPacket, error) {
 	if !ok {
 		return nil, errors.New("not echo body")
 	}
-
 	if uint16(body.ID) != ICMPIdentifier {
 		return nil, errors.New("wrong identifier")
 	}
 
-	// body.Data starts after the 4-byte echo header (ID+Seq); that's already
-	// parsed into body.ID and body.Seq, so body.Data is pure tunnel payload.
 	payload := make([]byte, len(body.Data))
 	copy(payload, body.Data)
 
-	var srcIP net.IP
+	// Preserve the full IPAddr including Zone so link-local replies work.
+	var srcAddr *net.IPAddr
 	switch a := src.(type) {
-	case *net.UDPAddr:
-		srcIP = a.IP
 	case *net.IPAddr:
-		srcIP = a.IP
+		srcAddr = &net.IPAddr{IP: a.IP, Zone: a.Zone}
+	case *net.UDPAddr:
+		srcAddr = &net.IPAddr{IP: a.IP, Zone: a.Zone}
+	default:
+		srcAddr = &net.IPAddr{IP: net.IPv6zero}
 	}
 
 	return &RawPacket{
-		Src:  srcIP,
+		Src:  srcAddr,
 		Type: msgType,
 		Data: payload,
 	}, nil

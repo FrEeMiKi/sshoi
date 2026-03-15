@@ -13,6 +13,7 @@ import (
 
 // Config holds server startup parameters.
 type Config struct {
+	IfaceName         string // outbound interface, e.g. "eth0"
 	SSHDAddr          string // e.g. "127.0.0.1:22"
 	Cipher            *tunnel.Cipher
 	KeepaliveInterval time.Duration
@@ -20,10 +21,12 @@ type Config struct {
 	WindowSize        uint32
 }
 
-// sessionEntry pairs a Session with the originating client IP.
+// sessionEntry pairs a Session with the originating client address.
+// clientAddr preserves the Zone so replies to link-local addresses are routed
+// to the correct interface.
 type sessionEntry struct {
-	session  *tunnel.Session
-	clientIP net.IP
+	session    *tunnel.Session
+	clientAddr *net.IPAddr // includes Zone for fe80:: addresses
 }
 
 // Server manages all active tunnel sessions.
@@ -31,14 +34,14 @@ type Server struct {
 	cfg      Config
 	conn     *icmpv6.Conn
 	sessions sync.Map // map[uint16]*sessionEntry
-	mu       sync.Map // map[uint16]struct{} — tracks sessions being opened
+	opening  sync.Map // map[uint16]struct{} — guards against duplicate SYNs
 	closed   chan struct{}
 	once     sync.Once
 }
 
 // New creates a Server.
 func New(cfg Config) (*Server, error) {
-	conn, err := icmpv6.Listen(256)
+	conn, err := icmpv6.Listen(cfg.IfaceName, 256)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +81,6 @@ func (s *Server) icmpRecvLoop() {
 			if !ok {
 				return
 			}
-			// Server receives Echo Requests (type 128).
 			if pkt.Type != icmpv6.ICMPv6TypeEchoRequest {
 				continue
 			}
@@ -91,9 +93,7 @@ func (s *Server) icmpRecvLoop() {
 				continue
 			}
 
-			if _, exists := s.sessions.Load(hdr.SessionID); exists {
-				// Existing session — hand off.
-				v, _ := s.sessions.Load(hdr.SessionID)
+			if v, exists := s.sessions.Load(hdr.SessionID); exists {
 				entry := v.(*sessionEntry)
 				if err := entry.session.ReceivePacket(pkt.Data); err != nil {
 					log.Printf("server: session %d recv err: %v", hdr.SessionID, err)
@@ -101,14 +101,16 @@ func (s *Server) icmpRecvLoop() {
 				continue
 			}
 
-			// New session ID.
 			if hdr.Flags&tunnel.FlagSYN != 0 {
-				// Guard against concurrent duplicate SYNs.
-				if _, loaded := s.mu.LoadOrStore(hdr.SessionID, struct{}{}); !loaded {
-					go func(raw []byte, src net.IP, id uint16) {
+				if _, loaded := s.opening.LoadOrStore(hdr.SessionID, struct{}{}); !loaded {
+					raw := make([]byte, len(pkt.Data))
+					copy(raw, pkt.Data)
+					src := pkt.Src
+					id := hdr.SessionID
+					go func() {
 						s.openSession(src, raw, id)
-						s.mu.Delete(id)
-					}(pkt.Data, pkt.Src, hdr.SessionID)
+						s.opening.Delete(id)
+					}()
 				}
 			} else {
 				log.Printf("server: unknown session %d (no SYN), dropping", hdr.SessionID)
@@ -121,15 +123,12 @@ func (s *Server) icmpRecvLoop() {
 }
 
 // openSession handles the first SYN for a new session.
-func (s *Server) openSession(clientIP net.IP, synRaw []byte, id uint16) {
-	log.Printf("server: new session %d from %s", id, clientIP)
+func (s *Server) openSession(clientAddr *net.IPAddr, synRaw []byte, id uint16) {
+	log.Printf("server: new session %d from %s", id, clientAddr)
 
-	// Dial sshd first; fail fast with FIN if unreachable.
 	tcpConn, err := net.DialTimeout("tcp", s.cfg.SSHDAddr, 5*time.Second)
 	if err != nil {
 		log.Printf("server: dial sshd failed for session %d: %v", id, err)
-		// Send FIN to client.
-		s.sendFIN(clientIP, id)
 		return
 	}
 
@@ -144,18 +143,15 @@ func (s *Server) openSession(clientIP net.IP, synRaw []byte, id uint16) {
 	sess.AttachTCPConn(tcpConn)
 	sess.StartEncodeLoop()
 
-	entry := &sessionEntry{session: sess, clientIP: clientIP}
+	entry := &sessionEntry{session: sess, clientAddr: clientAddr}
 	s.sessions.Store(id, entry)
 
-	// Start the send loop for this session.
 	go s.icmpSendLoopForSession(entry)
 
-	// Process the initial SYN packet.
 	if err := sess.ReceivePacket(synRaw); err != nil {
 		log.Printf("server: session %d initial SYN error: %v", id, err)
 	}
 
-	// Wait for session to close, then deregister.
 	<-sess.Done()
 	s.sessions.Delete(id)
 	log.Printf("server: session %d cleaned up", id)
@@ -170,8 +166,8 @@ func (s *Server) icmpSendLoopForSession(entry *sessionEntry) {
 			if !ok {
 				return
 			}
-			if err := s.conn.SendEchoReply(entry.clientIP, wire); err != nil {
-				log.Printf("server: send reply to %s error: %v", entry.clientIP, err)
+			if err := s.conn.SendEchoReply(entry.clientAddr, wire); err != nil {
+				log.Printf("server: send reply to %s error: %v", entry.clientAddr, err)
 			}
 		case <-sess.Done():
 			return
@@ -179,12 +175,4 @@ func (s *Server) icmpSendLoopForSession(entry *sessionEntry) {
 			return
 		}
 	}
-}
-
-// sendFIN sends a bare FIN packet to notify the client of failure.
-func (s *Server) sendFIN(clientIP net.IP, sessionID uint16) {
-	// Build a minimal FIN wire packet (no cipher — use a placeholder).
-	// We need a cipher to build it; if we don't have one we can't authenticate.
-	// In this implementation we log and drop since the client will time out.
-	log.Printf("server: unable to send FIN to %s for session %d (no cipher context)", clientIP, sessionID)
 }
