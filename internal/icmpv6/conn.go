@@ -16,9 +16,14 @@ import (
 const (
 	ICMPv6TypeEchoRequest = 128
 	ICMPv6TypeEchoReply   = 129
-	// ICMPIdentifier is stamped in every ICMP echo packet so the receive
-	// loop can filter out non-sshoi pings.
-	ICMPIdentifier = 0x5348 // "SH"
+	// ICMPRequestID is stamped in Echo Requests (client→server).
+	ICMPRequestID = 0x5348 // "SH"
+	// ICMPReplyID is stamped in Echo Replies (server→client).
+	// Using a different ID from ICMPRequestID lets the client filter out
+	// kernel-generated auto-replies: the Linux kernel echoes back Echo
+	// Requests with the same ID (0x5348), so the client only accepts
+	// replies with ID 0x5349 — rejecting the kernel echoes.
+	ICMPReplyID = 0x5349 // "SI"
 
 	maxICMPPayload = 65507
 	readBufSize    = 65535
@@ -97,11 +102,16 @@ func (c *Conn) Close() error {
 }
 
 // send constructs and transmits an ICMPv6 echo packet.
+// Echo Requests use ICMPRequestID; Echo Replies use ICMPReplyID.
 func (c *Conn) send(msgType icmp.Type, dst *net.IPAddr, data []byte) error {
 	if len(data) > maxICMPPayload {
 		return errors.New("payload too large")
 	}
-	wire, err := buildICMPv6(msgType, data)
+	id := uint16(ICMPReplyID)
+	if msgType == ipv6.ICMPTypeEchoRequest {
+		id = ICMPRequestID
+	}
+	wire, err := buildICMPv6(msgType, id, data)
 	if err != nil {
 		return err
 	}
@@ -109,11 +119,11 @@ func (c *Conn) send(msgType icmp.Type, dst *net.IPAddr, data []byte) error {
 	return err
 }
 
-// buildICMPv6 marshals an ICMPv6 echo message with our identifier.
-func buildICMPv6(msgType icmp.Type, data []byte) ([]byte, error) {
+// buildICMPv6 marshals an ICMPv6 echo message with the given identifier.
+func buildICMPv6(msgType icmp.Type, id uint16, data []byte) ([]byte, error) {
 	// Echo body: ID(2) + Seq(2) + tunnel payload
 	body := make([]byte, 4+len(data))
-	binary.BigEndian.PutUint16(body[0:2], ICMPIdentifier)
+	binary.BigEndian.PutUint16(body[0:2], id)
 	binary.BigEndian.PutUint16(body[2:4], 0) // ICMP seq=0; tunnel seq is in payload
 	copy(body[4:], data)
 
@@ -176,11 +186,14 @@ func parseICMPv6(raw []byte, src net.Addr) (*RawPacket, error) {
 	}
 
 	var msgType byte
+	var expectedID uint16
 	switch msg.Type {
 	case ipv6.ICMPTypeEchoRequest:
 		msgType = ICMPv6TypeEchoRequest
+		expectedID = ICMPRequestID
 	case ipv6.ICMPTypeEchoReply:
 		msgType = ICMPv6TypeEchoReply
+		expectedID = ICMPReplyID
 	default:
 		return nil, errors.New("not echo")
 	}
@@ -189,7 +202,11 @@ func parseICMPv6(raw []byte, src net.Addr) (*RawPacket, error) {
 	if !ok {
 		return nil, errors.New("not echo body")
 	}
-	if uint16(body.ID) != ICMPIdentifier {
+	// Validate the ICMP identifier. The Linux kernel auto-replies to Echo
+	// Requests using the same ID as the request (ICMPRequestID=0x5348).
+	// Since sshoi-server sends replies with ICMPReplyID=0x5349, the client
+	// filters out kernel echoes by rejecting replies with the wrong ID.
+	if uint16(body.ID) != expectedID {
 		return nil, errors.New("wrong identifier")
 	}
 
