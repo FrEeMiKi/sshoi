@@ -20,7 +20,12 @@ func main() {
 	passphrase := flag.String("passphrase", "", "Shared passphrase (or set SSHOI_PASSPHRASE)")
 	keepalive := flag.Duration("keepalive", 15*time.Second, "Keepalive interval")
 	retransmit := flag.Duration("retransmit", 500*time.Millisecond, "Retransmit timeout")
+	verbose := flag.Bool("v", false, "Verbose logging")
 	flag.Parse()
+
+	if *verbose {
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	}
 
 	if *server == "" {
 		log.Fatal("client: -server is required")
