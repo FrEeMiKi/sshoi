@@ -262,10 +262,15 @@ func (s *Session) handleFlags(pkt *Packet) {
 		s.mu.Unlock()
 
 	case flags&FlagDATA != 0:
-		// Data packet.
+		// Data packet — advance our send window then ACK immediately.
+		// Without the ACK the sender would retransmit until it hits
+		// MaxRetransmitAttempts (causing the "max retransmit exceeded"
+		// close) whenever the session is idle and no DATA is flowing in
+		// the reverse direction to piggyback an ACK.
 		s.mu.Lock()
 		s.sendQ.Acknowledge(pkt.Ack)
 		s.mu.Unlock()
+		go func() { _ = s.sendControlPacket(FlagACK) }()
 		if len(pkt.Payload) > 0 {
 			log.Printf("session %d: DATA rx seq=%d ack=%d len=%d", s.id, pkt.Seq, pkt.Ack, len(pkt.Payload))
 			select {
