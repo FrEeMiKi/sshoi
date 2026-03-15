@@ -168,12 +168,17 @@ func (s *Session) ReceivePacket(raw []byte) error {
 		Payload: plaintext,
 	}
 
-	s.mu.Lock()
-	isNew, _ := s.recvTrack.Receive(h.Seq)
-	s.mu.Unlock()
-
-	if !isNew && h.Flags&(FlagDATA) != 0 {
-		return nil // duplicate data packet
+	// Sequence tracking is only applied to DATA packets.
+	// Control packets (SYN, ACK, FIN, KA) all use seq=0 and must NOT be
+	// fed into recvTrack — otherwise the first DATA packet (also seq=0)
+	// would be rejected as a duplicate.
+	if h.Flags&FlagDATA != 0 {
+		s.mu.Lock()
+		isNew, _ := s.recvTrack.Receive(h.Seq)
+		s.mu.Unlock()
+		if !isNew {
+			return nil // duplicate data packet
+		}
 	}
 
 	s.lastActivity = time.Now()
@@ -272,14 +277,16 @@ func (s *Session) handleFlags(pkt *Packet) {
 
 // sendControlPacket builds and enqueues a control packet (SYN/FIN/ACK/KA)
 // with no payload.
+//
+// Control packets always use Seq=0. They do NOT consume from the DATA
+// sequence space (sendQ.PeekNext). This is critical: DATA packets start
+// at seq=0, and if a control packet also used seq=0, the receiver's
+// RecvTracker would mark that slot as already seen and silently drop the
+// first DATA packet.
 func (s *Session) sendControlPacket(flags byte, ack uint32) error {
-	s.mu.Lock()
-	seq := s.sendQ.PeekNext()
-	s.mu.Unlock()
-
 	hdr := Header{
 		SessionID:  s.id,
-		Seq:        seq,
+		Seq:        0, // control packets do not participate in the DATA seq space
 		Ack:        ack,
 		Flags:      flags,
 		PayloadLen: 0,
