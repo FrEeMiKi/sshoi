@@ -114,7 +114,7 @@ func NewSession(cfg SessionConfig) *Session {
 		// Client: send SYN immediately.
 		s.state = StateHandshake
 		go func() {
-			if err := s.sendControlPacket(FlagSYN, 0); err != nil {
+			if err := s.sendControlPacket(FlagSYN); err != nil {
 				log.Printf("session %d: SYN send failed: %v", s.id, err)
 			}
 		}()
@@ -195,7 +195,7 @@ func (s *Session) Close() {
 		}
 		s.mu.Unlock()
 
-		_ = s.sendControlPacket(FlagFIN|FlagACK, s.recvTrack.NextExpected())
+		_ = s.sendControlPacket(FlagFIN | FlagACK)
 
 		s.mu.Lock()
 		s.state = StateClosed
@@ -235,7 +235,7 @@ func (s *Session) handleFlags(pkt *Packet) {
 		if state == StateHandshake {
 			s.markEstablished()
 			log.Printf("session %d: established", s.id)
-			_ = s.sendControlPacket(FlagACK, pkt.Seq+1)
+			_ = s.sendControlPacket(FlagACK)
 		}
 
 	case flags&FlagSYN != 0:
@@ -243,7 +243,7 @@ func (s *Session) handleFlags(pkt *Packet) {
 		if state == StateNew {
 			s.markEstablished()
 			log.Printf("session %d: established (server)", s.id)
-			_ = s.sendControlPacket(FlagSYN|FlagACK, pkt.Seq+1)
+			_ = s.sendControlPacket(FlagSYN | FlagACK)
 		}
 
 	case flags&FlagFIN != 0:
@@ -253,7 +253,7 @@ func (s *Session) handleFlags(pkt *Packet) {
 
 	case flags&FlagKA != 0:
 		// Keepalive — just ACK.
-		_ = s.sendControlPacket(FlagACK, pkt.Seq+1)
+		_ = s.sendControlPacket(FlagACK)
 
 	case flags&FlagACK != 0 && flags&FlagDATA == 0:
 		// Pure ACK — advance send window.
@@ -267,6 +267,7 @@ func (s *Session) handleFlags(pkt *Packet) {
 		s.sendQ.Acknowledge(pkt.Ack)
 		s.mu.Unlock()
 		if len(pkt.Payload) > 0 {
+			log.Printf("session %d: DATA rx seq=%d ack=%d len=%d", s.id, pkt.Seq, pkt.Ack, len(pkt.Payload))
 			select {
 			case s.inbound <- pkt.Payload:
 			case <-s.closed:
@@ -278,15 +279,20 @@ func (s *Session) handleFlags(pkt *Packet) {
 // sendControlPacket builds and enqueues a control packet (SYN/FIN/ACK/KA)
 // with no payload.
 //
-// Control packets always use Seq=0. They do NOT consume from the DATA
-// sequence space (sendQ.PeekNext). This is critical: DATA packets start
-// at seq=0, and if a control packet also used seq=0, the receiver's
-// RecvTracker would mark that slot as already seen and silently drop the
-// first DATA packet.
-func (s *Session) sendControlPacket(flags byte, ack uint32) error {
+// Rules:
+//   - Seq is always 0. Control packets do not consume the DATA sequence space.
+//   - Ack is recvTrack.NextExpected() — reflects how many DATA packets from
+//     the remote side have been received (0 when none). Since Acknowledge uses
+//     strict less-than, ack=0 removes nothing from the peer's retransmit queue,
+//     so a handshake ACK cannot prematurely evict unreceived data packets.
+func (s *Session) sendControlPacket(flags byte) error {
+	s.mu.Lock()
+	ack := s.recvTrack.NextExpected()
+	s.mu.Unlock()
+
 	hdr := Header{
 		SessionID:  s.id,
-		Seq:        0, // control packets do not participate in the DATA seq space
+		Seq:        0,
 		Ack:        ack,
 		Flags:      flags,
 		PayloadLen: 0,
@@ -347,7 +353,7 @@ func (s *Session) tcpReadLoop() {
 			select {
 			case <-s.closed:
 			default:
-				log.Printf("session %d: tcp read: %v", s.id, err)
+				log.Printf("session %d: closing — tcp read error: %v", s.id, err)
 				go s.Close()
 			}
 			return
@@ -379,7 +385,7 @@ func (s *Session) tcpWriteLoop() {
 				select {
 				case <-s.closed:
 				default:
-					log.Printf("session %d: tcp write: %v", s.id, err)
+					log.Printf("session %d: closing — tcp write error: %v", s.id, err)
 					go s.Close()
 				}
 				return
@@ -472,7 +478,7 @@ func (s *Session) keepaliveLoop() {
 			if state != StateEstablished {
 				continue
 			}
-			if err := s.sendControlPacket(FlagKA, 0); err != nil {
+			if err := s.sendControlPacket(FlagKA); err != nil {
 				log.Printf("session %d: keepalive failed: %v", s.id, err)
 			}
 		case <-s.closed:

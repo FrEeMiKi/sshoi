@@ -53,12 +53,14 @@ func (q *SendQueue) Enqueue(wireBytes []byte) (uint32, error) {
 	return seq, nil
 }
 
-// Acknowledge removes all entries with Seq <= ack (cumulative ACK).
+// Acknowledge removes entries with Seq < ack (TCP-style: ack=N means
+// "received everything up to seq N-1 inclusive").
+// ack=0 removes nothing; ack=1 removes seq=0; ack=2 removes seq=0,1; etc.
 func (q *SendQueue) Acknowledge(ack uint32) int {
 	removed := 0
 	i := 0
 	for i < len(q.entries) {
-		if seqLE(q.entries[i].Seq, ack) {
+		if seqLT(q.entries[i].Seq, ack) {
 			removed++
 			i++
 		} else {
@@ -88,9 +90,10 @@ func (q *SendQueue) PeekNext() uint32 { return q.nextSeq }
 // InFlight returns the number of unacknowledged entries.
 func (q *SendQueue) InFlight() int { return len(q.entries) }
 
-// seqLE compares two uint32 sequence numbers with wrap-around handling.
-func seqLE(a, b uint32) bool {
-	return int32(a-b) <= 0
+// seqLT returns true if sequence number a comes strictly before b,
+// handling uint32 wrap-around.
+func seqLT(a, b uint32) bool {
+	return int32(a-b) < 0
 }
 
 // RecvTracker tracks received sequence numbers to detect duplicates.

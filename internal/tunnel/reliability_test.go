@@ -26,7 +26,8 @@ func TestSendQueue_EnqueueAck(t *testing.T) {
 		t.Errorf("expected 3 in-flight")
 	}
 
-	removed := q.Acknowledge(1)
+	// TCP-style: ack=2 means "received seq 0 and seq 1" (everything < 2).
+	removed := q.Acknowledge(2)
 	if removed != 2 {
 		t.Errorf("expected 2 removed, got %d", removed)
 	}
