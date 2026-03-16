@@ -13,7 +13,7 @@ SSH client ──TCP:2222──► sshoi-client ──ICMPv6 Echo Req──► s
 Each SSH connection is a multiplexed **session** identified by a 16-bit session
 ID carried inside the ICMPv6 payload. All payloads are encrypted with
 **XChaCha20-Poly1305** using a key derived from a shared passphrase via
-HKDF-SHA256. The header fields (session ID, sequence, ACK, flags) are
+Argon2id (64 MiB, 4 threads, 1 iteration). The header fields (session ID, sequence, ACK, flags) are
 authenticated as AAD, preventing replay or injection attacks.
 
 ### Wire Format
@@ -129,7 +129,8 @@ ssh -p 2222 user@127.0.0.1
   ip6tables -A INPUT -p icmpv6 --icmpv6-type echo-request -j DROP
   ```
 - The passphrase is never used directly; it is always stretched through
-  HKDF-SHA256 before reaching the AEAD.
+  Argon2id (64 MiB, 4 threads, 1 iteration) before reaching the AEAD,
+  providing brute-force resistance against offline dictionary attacks.
 
 ## Comparison with Similar Tools
 
