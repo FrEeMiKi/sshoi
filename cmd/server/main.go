@@ -26,7 +26,9 @@ func main() {
 	}
 
 	pass := *passphrase
-	if pass == "" {
+	if pass != "" {
+		log.Printf("server: WARNING: -passphrase flag exposes the secret in the process list; prefer the SSHOI_PASSPHRASE environment variable")
+	} else {
 		pass = os.Getenv("SSHOI_PASSPHRASE")
 	}
 	if pass == "" {

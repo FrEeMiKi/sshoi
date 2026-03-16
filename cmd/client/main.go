@@ -48,7 +48,9 @@ func main() {
 	serverAddr := &net.IPAddr{IP: serverIP, Zone: *iface}
 
 	pass := *passphrase
-	if pass == "" {
+	if pass != "" {
+		log.Printf("client: WARNING: -passphrase flag exposes the secret in the process list; prefer the SSHOI_PASSPHRASE environment variable")
+	} else {
 		pass = os.Getenv("SSHOI_PASSPHRASE")
 	}
 	if pass == "" {

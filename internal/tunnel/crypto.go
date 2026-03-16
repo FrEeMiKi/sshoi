@@ -5,14 +5,23 @@ import (
 	"errors"
 	"io"
 
+	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/hkdf"
-	"crypto/sha256"
 )
 
 var ErrDecryptFailed = errors.New("AEAD open failed: authentication tag mismatch")
 
-const hkdfSalt = "sshoi-v1-key-derivation"
+// argon2Salt is a fixed domain separator. Both peers must agree on the same
+// passphrase; a fixed salt is correct here because the passphrase is the
+// secret (not the salt) and deterministic derivation is required.
+const argon2Salt = "sshoi-v1-key-derivation"
+
+// Argon2id parameters (OWASP recommended minimums for interactive use).
+const (
+	argon2Time    = 1
+	argon2Memory  = 64 * 1024 // 64 MiB
+	argon2Threads = 4
+)
 
 // Cipher wraps an XChaCha20-Poly1305 AEAD.
 type Cipher struct {
@@ -36,14 +45,19 @@ func NewCipherFromKey(key []byte) (*Cipher, error) {
 	return &Cipher{aead: aead}, nil
 }
 
-// NewCipherFromPassphrase derives a 32-byte key via HKDF-SHA256 and calls
-// NewCipherFromKey.
+// NewCipherFromPassphrase derives a 32-byte key via Argon2id and calls
+// NewCipherFromKey. Argon2id provides brute-force resistance that HKDF/SHA256
+// does not — an attacker who captures traffic cannot test millions of
+// passphrase guesses per second.
 func NewCipherFromPassphrase(passphrase string) (*Cipher, error) {
-	r := hkdf.New(sha256.New, []byte(passphrase), []byte(hkdfSalt), nil)
-	key := make([]byte, chacha20poly1305.KeySize)
-	if _, err := io.ReadFull(r, key); err != nil {
-		return nil, err
-	}
+	key := argon2.IDKey(
+		[]byte(passphrase),
+		[]byte(argon2Salt),
+		argon2Time,
+		argon2Memory,
+		argon2Threads,
+		chacha20poly1305.KeySize,
+	)
 	return NewCipherFromKey(key)
 }
 

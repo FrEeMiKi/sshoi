@@ -181,7 +181,9 @@ func (s *Session) ReceivePacket(raw []byte) error {
 		}
 	}
 
+	s.mu.Lock()
 	s.lastActivity = time.Now()
+	s.mu.Unlock()
 	s.handleFlags(pkt)
 	return nil
 }
@@ -470,7 +472,9 @@ func (s *Session) retransmitLoop() {
 	}
 }
 
-// keepaliveLoop sends periodic KA packets.
+// keepaliveLoop sends periodic KA packets and enforces an idle timeout.
+// If no packet has been received for 3× the keepalive interval the session
+// is closed — this handles dead peers and stalled handshakes alike.
 func (s *Session) keepaliveLoop() {
 	ticker := time.NewTicker(s.keepaliveInterval)
 	defer ticker.Stop()
@@ -479,7 +483,15 @@ func (s *Session) keepaliveLoop() {
 		case <-ticker.C:
 			s.mu.Lock()
 			state := s.state
+			idle := time.Since(s.lastActivity)
 			s.mu.Unlock()
+
+			if idle > s.keepaliveInterval*3 {
+				log.Printf("session %d: idle for %v with no response, closing", s.id, idle.Round(time.Second))
+				go s.Close()
+				return
+			}
+
 			if state != StateEstablished {
 				continue
 			}
