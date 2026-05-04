@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"encoding/binary"
 	"log"
 	"net"
 	"sync"
@@ -237,7 +236,9 @@ func (s *Session) handleFlags(pkt *Packet) {
 		if state == StateHandshake {
 			s.markEstablished()
 			log.Printf("session %d: established", s.id)
-			_ = s.sendControlPacket(FlagACK)
+			if err := s.sendControlPacket(FlagACK); err != nil {
+				log.Printf("session %d: ACK send failed: %v", s.id, err)
+			}
 		}
 
 	case flags&FlagSYN != 0:
@@ -245,7 +246,9 @@ func (s *Session) handleFlags(pkt *Packet) {
 		if state == StateNew {
 			s.markEstablished()
 			log.Printf("session %d: established (server)", s.id)
-			_ = s.sendControlPacket(FlagSYN | FlagACK)
+			if err := s.sendControlPacket(FlagSYN | FlagACK); err != nil {
+				log.Printf("session %d: SYN+ACK send failed: %v", s.id, err)
+			}
 		}
 
 	case flags&FlagFIN != 0:
@@ -255,7 +258,9 @@ func (s *Session) handleFlags(pkt *Packet) {
 
 	case flags&FlagKA != 0:
 		// Keepalive — just ACK.
-		_ = s.sendControlPacket(FlagACK)
+		if err := s.sendControlPacket(FlagACK); err != nil {
+			log.Printf("session %d: KA ACK send failed: %v", s.id, err)
+		}
 
 	case flags&FlagACK != 0 && flags&FlagDATA == 0:
 		// Pure ACK — advance send window.
@@ -272,7 +277,11 @@ func (s *Session) handleFlags(pkt *Packet) {
 		s.mu.Lock()
 		s.sendQ.Acknowledge(pkt.Ack)
 		s.mu.Unlock()
-		go func() { _ = s.sendControlPacket(FlagACK) }()
+		go func() {
+			if err := s.sendControlPacket(FlagACK); err != nil {
+				log.Printf("session %d: DATA ACK send failed: %v", s.id, err)
+			}
+		}()
 		if len(pkt.Payload) > 0 {
 			log.Printf("session %d: DATA rx seq=%d ack=%d len=%d", s.id, pkt.Seq, pkt.Ack, len(pkt.Payload))
 			select {
@@ -310,13 +319,13 @@ func (s *Session) sendControlPacket(flags byte) error {
 
 // buildAndEnqueue encrypts a packet and pushes it onto SendWire.
 func (s *Session) buildAndEnqueue(hdr Header, plaintext []byte) error {
-	// Build the header bytes for AAD.
-	aadBuf := make([]byte, HeaderLen)
-	if err := EncodeHeader(aadBuf, hdr); err != nil {
+	// Stack-allocated header bytes used as AAD — avoids a heap allocation per packet.
+	var aadBuf [HeaderLen]byte
+	if err := EncodeHeader(aadBuf[:], hdr); err != nil {
 		return err
 	}
 
-	nonce, ciphertext, err := s.cipher.Seal(plaintext, aadBuf)
+	nonce, ciphertext, err := s.cipher.Seal(plaintext, aadBuf[:])
 	if err != nil {
 		return err
 	}
@@ -345,16 +354,14 @@ func (s *Session) buildAndEnqueue(hdr Header, plaintext []byte) error {
 
 // tcpReadLoop reads from the TCP connection and feeds outbound.
 func (s *Session) tcpReadLoop() {
+	s.mu.Lock()
+	conn := s.tcpConn
+	s.mu.Unlock()
+	if conn == nil {
+		return
+	}
 	buf := make([]byte, MaxPayload)
 	for {
-		s.mu.Lock()
-		conn := s.tcpConn
-		s.mu.Unlock()
-		if conn == nil {
-			time.Sleep(5 * time.Millisecond)
-			continue
-		}
-
 		n, err := conn.Read(buf)
 		if err != nil {
 			select {
@@ -379,15 +386,15 @@ func (s *Session) tcpReadLoop() {
 
 // tcpWriteLoop writes inbound data to the TCP connection.
 func (s *Session) tcpWriteLoop() {
+	s.mu.Lock()
+	conn := s.tcpConn
+	s.mu.Unlock()
+	if conn == nil {
+		return
+	}
 	for {
 		select {
 		case data := <-s.inbound:
-			s.mu.Lock()
-			conn := s.tcpConn
-			s.mu.Unlock()
-			if conn == nil {
-				continue
-			}
 			if _, err := conn.Write(data); err != nil {
 				select {
 				case <-s.closed:
@@ -504,11 +511,3 @@ func (s *Session) keepaliveLoop() {
 	}
 }
 
-// seqFromPayload extracts the 32-bit seq from a wire packet's SEQ field for
-// logging purposes without full decode.
-func seqFromPayload(wire []byte) uint32 {
-	if len(wire) < 10 {
-		return 0
-	}
-	return binary.BigEndian.Uint32(wire[6:10])
-}

@@ -1,0 +1,21 @@
+# Binaries
+sshoi-client
+sshoi-server
+*.o
+*.bin
+
+# macOS
+.DS_Store
+
+# Build output
+dist/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+
+# Go
+vendor/
