@@ -91,7 +91,9 @@ func (c *Client) Close() error {
 	c.once.Do(func() {
 		close(c.closed)
 		c.sessions.Range(func(_, v interface{}) bool {
-			v.(*tunnel.Session).Close()
+			if sess, ok := v.(*tunnel.Session); ok {
+				sess.Close()
+			}
 			return true
 		})
 		err = c.conn.Close()
@@ -174,7 +176,11 @@ func (c *Client) icmpRecvLoop() {
 				log.Printf("client: unknown session %d, dropping", hdr.SessionID)
 				continue
 			}
-			if err := v.(*tunnel.Session).ReceivePacket(pkt.Data); err != nil {
+			sess, ok := v.(*tunnel.Session)
+			if !ok {
+				continue
+			}
+			if err := sess.ReceivePacket(pkt.Data); err != nil {
 				log.Printf("client: session %d recv error: %v", hdr.SessionID, err)
 			}
 		case <-c.closed:

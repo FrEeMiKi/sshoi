@@ -29,14 +29,17 @@ type sessionEntry struct {
 	clientAddr *net.IPAddr // includes Zone for fe80:: addresses
 }
 
+const maxConcurrentOpening = 100
+
 // Server manages all active tunnel sessions.
 type Server struct {
-	cfg      Config
-	conn     *icmpv6.Conn
-	sessions sync.Map // map[uint16]*sessionEntry
-	opening  sync.Map // map[uint16]struct{} — guards against duplicate SYNs
-	closed   chan struct{}
-	once     sync.Once
+	cfg        Config
+	conn       *icmpv6.Conn
+	sessions   sync.Map    // map[uint16]*sessionEntry
+	opening    sync.Map    // map[uint16]struct{} — guards against duplicate SYNs
+	openingSem chan struct{} // limits concurrent session-open goroutines
+	closed     chan struct{}
+	once       sync.Once
 }
 
 // New creates a Server.
@@ -46,9 +49,10 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cfg:    cfg,
-		conn:   conn,
-		closed: make(chan struct{}),
+		cfg:        cfg,
+		conn:       conn,
+		openingSem: make(chan struct{}, maxConcurrentOpening),
+		closed:     make(chan struct{}),
 	}, nil
 }
 
@@ -65,7 +69,9 @@ func (s *Server) Close() error {
 	s.once.Do(func() {
 		close(s.closed)
 		s.sessions.Range(func(_, v interface{}) bool {
-			v.(*sessionEntry).session.Close()
+			if entry, ok := v.(*sessionEntry); ok {
+				entry.session.Close()
+			}
 			return true
 		})
 		err = s.conn.Close()
@@ -94,7 +100,10 @@ func (s *Server) icmpRecvLoop() {
 			}
 
 			if v, exists := s.sessions.Load(hdr.SessionID); exists {
-				entry := v.(*sessionEntry)
+				entry, ok := v.(*sessionEntry)
+				if !ok {
+					continue
+				}
 				if err := entry.session.ReceivePacket(pkt.Data); err != nil {
 					log.Printf("server: session %d recv err: %v", hdr.SessionID, err)
 				}
@@ -103,11 +112,19 @@ func (s *Server) icmpRecvLoop() {
 
 			if hdr.Flags&tunnel.FlagSYN != 0 {
 				if _, loaded := s.opening.LoadOrStore(hdr.SessionID, struct{}{}); !loaded {
+					select {
+					case s.openingSem <- struct{}{}:
+					default:
+						log.Printf("server: concurrent open limit reached, dropping SYN for session %d", hdr.SessionID)
+						s.opening.Delete(hdr.SessionID)
+						continue
+					}
 					raw := make([]byte, len(pkt.Data))
 					copy(raw, pkt.Data)
 					src := pkt.Src
 					id := hdr.SessionID
 					go func() {
+						defer func() { <-s.openingSem }()
 						s.openSession(src, raw, id)
 						s.opening.Delete(id)
 					}()
